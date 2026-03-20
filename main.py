@@ -5,6 +5,7 @@ from typing import Optional, List, Dict, Set, Any
 import time
 import random
 from datetime import datetime
+import bisect
 
 # ==================== Models ====================
 
@@ -42,18 +43,18 @@ class Video(BaseModel):
     video_url: str
     thumbnail: str
     stats: Stats
-    timestamp: Optional[int] = None
+    timestamp: int  # Unix timestamp in milliseconds
 
 class PaginatedResponse(BaseModel):
     videos: List[Video]
-    next_cursor: Optional[str]
+    next_cursor: Optional[str]  # This is a timestamp string
     has_more: bool
 
 # ==================== App Setup ====================
 
 app = FastAPI(title="Viral API", version="1.0.0")
 
-# CORS - Allow all origins
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -64,13 +65,14 @@ app.add_middleware(
 
 # Constants
 TOTAL_VIDEOS = 10000
+VIDEOS_PER_PAGE = 10
 CURRENT_USER_ID = "user_001"
 
 # Storage
 likes_storage: Dict[str, Set[str]] = {}
 comments_storage: Dict[str, List[Comment]] = {}
 
-# Google video URLs (10 videos)
+# Google video URLs
 VIDEO_POOL = [
     "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyrides.mp4",
     "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
@@ -103,43 +105,74 @@ CAPTIONS = [
     "This is the content we need! 🙌"
 ]
 
-# Author (same for all videos)
+# Author
 AUTHOR = Author(
     name="@tiktok_user",
     avatar="https://randomuser.me/api/portraits/women/8.jpg"
 )
 
-# ==================== Helper Functions ====================
+# ==================== Video Generation with Real Timestamps ====================
 
-def generate_video_id(index: int) -> str:
-    """Generate video ID with timestamp and index"""
-    timestamp = int(time.time() * 1000) - (index * 86400000)  # 1 day = 86400000 ms
-    return f"{timestamp}_{index:05d}"
-
-def generate_videos(start_index: int, limit: int) -> List[dict]:
-    """Generate videos on demand"""
-    videos = []
-    for i in range(start_index, min(start_index + limit, TOTAL_VIDEOS)):
-        # Deterministic but varied data based on index
-        random.seed(i)
-        
-        video = {
-            "id": generate_video_id(i),
-            "author": AUTHOR,
-            "caption": CAPTIONS[i % len(CAPTIONS)],
-            "hashtags": ["fyp", "viral", "trending", "explore", f"tag{i % 100}"][:random.randint(3, 5)],
-            "video_url": VIDEO_POOL[i % len(VIDEO_POOL)],
-            "thumbnail": f"https://picsum.photos/400/800?random={i}",
-            "stats": {
-                "likes": random.randint(1000, 5000000),
-                "comments": random.randint(100, 50000),
-                "shares": random.randint(500, 200000)
-            },
-            "timestamp": int(time.time() * 1000) - (i * 86400000)
-        }
-        videos.append(video)
+def generate_video(index: int) -> dict:
+    """
+    Generate a single video with deterministic data.
+    Timestamp decreases with index (older videos have smaller timestamps)
+    """
+    # Timestamp: newer videos (smaller index) have LARGER timestamps
+    # This ensures chronological order when sorting by timestamp DESC
+    current_time = int(time.time() * 1000)
+    timestamp = current_time - (index * 3600000)  # Subtract 1 hour per video
+    
+    # Deterministic but varied data
+    random.seed(index)
+    
+    video = {
+        "id": f"{timestamp}_{index:05d}",  # ID format: timestamp_index
+        "author": AUTHOR,
+        "caption": CAPTIONS[index % len(CAPTIONS)],
+        "hashtags": ["fyp", "viral", "trending", f"tag{index % 100}"][:random.randint(3, 5)],
+        "video_url": VIDEO_POOL[index % len(VIDEO_POOL)],
+        "thumbnail": f"https://picsum.photos/400/800?random={index}",
+        "stats": {
+            "likes": random.randint(1000, 5000000),
+            "comments": random.randint(100, 50000),
+            "shares": random.randint(500, 200000)
+        },
+        "timestamp": timestamp
+    }
     
     random.seed()  # Reset seed
+    return video
+
+def get_videos_before_timestamp(timestamp: Optional[int], limit: int) -> List[dict]:
+    """
+    Get videos with timestamp < cursor timestamp.
+    This is true cursor-based pagination - stable even with new videos.
+    """
+    videos = []
+    
+    if timestamp is None:
+        # First page: start from newest (largest timestamp)
+        start_index = 0
+    else:
+        # Find index where timestamp < cursor
+        # Binary search to find the right starting point
+        start_index = 0
+        # Simple linear search for now (optimized for mock data)
+        # In production with DB, this would be a SQL query
+        for i in range(TOTAL_VIDEOS):
+            video_timestamp = int(time.time() * 1000) - (i * 3600000)
+            if video_timestamp < timestamp:
+                start_index = i
+                break
+        else:
+            start_index = TOTAL_VIDEOS
+    
+    # Generate videos starting from this index
+    for i in range(start_index, min(start_index + limit, TOTAL_VIDEOS)):
+        video = generate_video(i)
+        videos.append(video)
+    
     return videos
 
 # ==================== API Endpoints ====================
@@ -147,10 +180,10 @@ def generate_videos(start_index: int, limit: int) -> List[dict]:
 @app.get("/")
 async def root():
     return {
-        "message": "Viral API is running!",
+        "message": "Viral API is running with timestamp-based cursor pagination",
         "status": "healthy",
         "endpoints": {
-            "videos": "GET /videos?limit=10&cursor=0",
+            "videos": "GET /videos?limit=10&cursor=<timestamp>",
             "like": "POST /videos/{video_id}/like",
             "comments": "GET/POST /videos/{video_id}/comments",
             "health": "GET /health"
@@ -163,22 +196,29 @@ async def health():
 
 @app.get("/videos", response_model=PaginatedResponse)
 async def get_videos(
-    limit: int = Query(10, ge=1, le=50, description="Number of videos to return"),
-    cursor: Optional[str] = Query(None, description="Cursor for pagination (video index)")
+    limit: int = Query(VIDEOS_PER_PAGE, ge=1, le=50, description="Number of videos to return"),
+    cursor: Optional[str] = Query(None, description="Timestamp cursor (last video's timestamp)")
 ):
-    """Get videos with cursor-based pagination. Use cursor=0 for first page."""
+    """
+    Get videos with true timestamp-based cursor pagination.
+    Use the timestamp from the last video as cursor for next page.
     
-    # Parse cursor (just use the index from cursor)
+    Example:
+    - First request: GET /videos?limit=10
+    - Response includes next_cursor (timestamp of last video)
+    - Next request: GET /videos?limit=10&cursor=1700000000000
+    """
+    
+    # Parse cursor as timestamp
+    cursor_timestamp = None
     if cursor:
         try:
-            start_index = int(cursor)
+            cursor_timestamp = int(cursor)
         except (ValueError, TypeError):
-            start_index = 0
-    else:
-        start_index = 0
+            raise HTTPException(status_code=400, detail="Invalid cursor format. Use timestamp integer.")
     
-    # Generate videos
-    videos_data = generate_videos(start_index, limit)
+    # Get videos before this timestamp
+    videos_data = get_videos_before_timestamp(cursor_timestamp, limit)
     
     if not videos_data:
         return PaginatedResponse(videos=[], next_cursor=None, has_more=False)
@@ -195,9 +235,19 @@ async def get_videos(
         
         videos.append(Video(**video_dict))
     
-    # Calculate next cursor
-    next_cursor = str(start_index + limit) if start_index + limit < TOTAL_VIDEOS else None
-    has_more = start_index + limit < TOTAL_VIDEOS
+    # Next cursor is the timestamp of the last video in this batch
+    last_video = videos[-1] if videos else None
+    next_cursor = str(last_video.timestamp) if last_video and len(videos) == limit else None
+    
+    # Determine if there are more videos
+    has_more = False
+    if last_video:
+        # Check if there's at least one more video with timestamp < last_video.timestamp
+        for i in range(TOTAL_VIDEOS):
+            video_timestamp = int(time.time() * 1000) - (i * 3600000)
+            if video_timestamp < last_video.timestamp:
+                has_more = True
+                break
     
     return PaginatedResponse(
         videos=videos,
@@ -209,12 +259,8 @@ async def get_videos(
 async def like_video(video_id: str, action: LikeAction):
     """Like or unlike a video"""
     
-    # Validate video ID format
-    try:
-        index = int(video_id.split('_')[1])
-        if index < 0 or index >= TOTAL_VIDEOS:
-            raise HTTPException(status_code=404, detail="Video not found")
-    except (ValueError, IndexError):
+    # Validate video ID exists (don't parse index, just check format)
+    if not video_id or len(video_id.split('_')) != 2:
         raise HTTPException(status_code=400, detail="Invalid video ID format")
     
     # Initialize storage
@@ -240,11 +286,7 @@ async def add_comment(video_id: str, comment: CommentCreate):
     """Add a comment to a video"""
     
     # Validate video ID
-    try:
-        index = int(video_id.split('_')[1])
-        if index < 0 or index >= TOTAL_VIDEOS:
-            raise HTTPException(status_code=404, detail="Video not found")
-    except (ValueError, IndexError):
+    if not video_id or len(video_id.split('_')) != 2:
         raise HTTPException(status_code=400, detail="Invalid video ID format")
     
     # Create new comment
@@ -274,27 +316,23 @@ async def get_comments(video_id: str):
     """Get comments for a video"""
     
     # Validate video ID
-    try:
-        index = int(video_id.split('_')[1])
-        if index < 0 or index >= TOTAL_VIDEOS:
-            raise HTTPException(status_code=404, detail="Video not found")
-    except (ValueError, IndexError):
+    if not video_id or len(video_id.split('_')) != 2:
         raise HTTPException(status_code=400, detail="Invalid video ID format")
     
     # Get comments from storage or generate mock
     if video_id in comments_storage:
         comments = comments_storage[video_id]
     else:
-        # Generate mock comments
+        # Generate mock comments (max 3)
         comments = []
-        mock_comments = [
+        mock_texts = [
             "This is amazing! 🔥",
             "Great content! 👏",
             "Love this video! ❤️",
             "So funny! 😂",
             "Can't stop watching!"
         ]
-        for i, text in enumerate(mock_comments[:random.randint(0, 3)]):
+        for i, text in enumerate(mock_texts[:random.randint(0, 3)]):
             comment = Comment(
                 id=f"cmt_{video_id}_{i}",
                 user=CommentUser(
@@ -316,10 +354,23 @@ async def get_stats():
     total_likes = sum(len(users) for users in likes_storage.values())
     total_comments = sum(len(comments) for comments in comments_storage.values())
     
+    # Get first 5 videos to show cursor example
+    sample_videos = []
+    for i in range(min(5, TOTAL_VIDEOS)):
+        video = generate_video(i)
+        sample_videos.append({
+            "id": video["id"],
+            "timestamp": video["timestamp"],
+            "caption": video["caption"][:30] + "..."
+        })
+    
     return {
         "total_videos": TOTAL_VIDEOS,
         "videos_with_likes": len(likes_storage),
         "total_likes": total_likes,
         "videos_with_comments": len(comments_storage),
-        "total_comments": total_comments
+        "total_comments": total_comments,
+        "pagination_type": "timestamp-based cursor",
+        "cursor_format": "Use timestamp from last video as cursor",
+        "sample_videos": sample_videos
     }
