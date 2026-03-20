@@ -5,7 +5,6 @@ from typing import Optional, List, Dict, Set, Any
 import time
 import random
 from datetime import datetime
-import bisect
 
 # ==================== Models ====================
 
@@ -35,6 +34,9 @@ class CommentCreate(BaseModel):
 class LikeAction(BaseModel):
     action: str
 
+class SaveAction(BaseModel):
+    action: str
+
 class Video(BaseModel):
     id: str
     author: Author
@@ -43,18 +45,18 @@ class Video(BaseModel):
     video_url: str
     thumbnail: str
     stats: Stats
-    timestamp: int  # Unix timestamp in milliseconds
+    timestamp: int
 
 class PaginatedResponse(BaseModel):
     videos: List[Video]
-    next_cursor: Optional[str]  # This is a timestamp string
+    next_cursor: Optional[str]
     has_more: bool
 
 # ==================== App Setup ====================
 
 app = FastAPI(title="Viral API", version="1.0.0")
 
-# CORS
+# CORS - Allow all origins for development
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -70,9 +72,10 @@ CURRENT_USER_ID = "user_001"
 
 # Storage
 likes_storage: Dict[str, Set[str]] = {}
+saves_storage: Dict[str, Set[str]] = {}
 comments_storage: Dict[str, List[Comment]] = {}
 
-# Google video URLs
+# Google video URLs (10 videos)
 VIDEO_POOL = [
     "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyrides.mp4",
     "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
@@ -111,23 +114,17 @@ AUTHOR = Author(
     avatar="https://randomuser.me/api/portraits/women/8.jpg"
 )
 
-# ==================== Video Generation with Real Timestamps ====================
+# ==================== Video Generation ====================
 
 def generate_video(index: int) -> dict:
-    """
-    Generate a single video with deterministic data.
-    Timestamp decreases with index (older videos have smaller timestamps)
-    """
-    # Timestamp: newer videos (smaller index) have LARGER timestamps
-    # This ensures chronological order when sorting by timestamp DESC
+    """Generate a single video with deterministic data"""
     current_time = int(time.time() * 1000)
-    timestamp = current_time - (index * 3600000)  # Subtract 1 hour per video
+    timestamp = current_time - (index * 3600000)
     
-    # Deterministic but varied data
     random.seed(index)
     
     video = {
-        "id": f"{timestamp}_{index:05d}",  # ID format: timestamp_index
+        "id": f"{timestamp}_{index:05d}",
         "author": AUTHOR,
         "caption": CAPTIONS[index % len(CAPTIONS)],
         "hashtags": ["fyp", "viral", "trending", f"tag{index % 100}"][:random.randint(3, 5)],
@@ -141,25 +138,17 @@ def generate_video(index: int) -> dict:
         "timestamp": timestamp
     }
     
-    random.seed()  # Reset seed
+    random.seed()
     return video
 
 def get_videos_before_timestamp(timestamp: Optional[int], limit: int) -> List[dict]:
-    """
-    Get videos with timestamp < cursor timestamp.
-    This is true cursor-based pagination - stable even with new videos.
-    """
+    """Get videos with timestamp < cursor timestamp"""
     videos = []
     
     if timestamp is None:
-        # First page: start from newest (largest timestamp)
         start_index = 0
     else:
-        # Find index where timestamp < cursor
-        # Binary search to find the right starting point
         start_index = 0
-        # Simple linear search for now (optimized for mock data)
-        # In production with DB, this would be a SQL query
         for i in range(TOTAL_VIDEOS):
             video_timestamp = int(time.time() * 1000) - (i * 3600000)
             if video_timestamp < timestamp:
@@ -168,7 +157,6 @@ def get_videos_before_timestamp(timestamp: Optional[int], limit: int) -> List[di
         else:
             start_index = TOTAL_VIDEOS
     
-    # Generate videos starting from this index
     for i in range(start_index, min(start_index + limit, TOTAL_VIDEOS)):
         video = generate_video(i)
         videos.append(video)
@@ -185,6 +173,7 @@ async def root():
         "endpoints": {
             "videos": "GET /videos?limit=10&cursor=<timestamp>",
             "like": "POST /videos/{video_id}/like",
+            "save": "POST /videos/{video_id}/save",
             "comments": "GET/POST /videos/{video_id}/comments",
             "health": "GET /health"
         }
@@ -196,53 +185,38 @@ async def health():
 
 @app.get("/videos", response_model=PaginatedResponse)
 async def get_videos(
-    limit: int = Query(VIDEOS_PER_PAGE, ge=1, le=50, description="Number of videos to return"),
-    cursor: Optional[str] = Query(None, description="Timestamp cursor (last video's timestamp)")
+    limit: int = Query(VIDEOS_PER_PAGE, ge=1, le=50),
+    cursor: Optional[str] = Query(None)
 ):
-    """
-    Get videos with true timestamp-based cursor pagination.
-    Use the timestamp from the last video as cursor for next page.
+    """Get videos with timestamp-based cursor pagination"""
     
-    Example:
-    - First request: GET /videos?limit=10
-    - Response includes next_cursor (timestamp of last video)
-    - Next request: GET /videos?limit=10&cursor=1700000000000
-    """
-    
-    # Parse cursor as timestamp
     cursor_timestamp = None
     if cursor:
         try:
             cursor_timestamp = int(cursor)
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="Invalid cursor format. Use timestamp integer.")
+            raise HTTPException(status_code=400, detail="Invalid cursor format")
     
-    # Get videos before this timestamp
     videos_data = get_videos_before_timestamp(cursor_timestamp, limit)
     
     if not videos_data:
         return PaginatedResponse(videos=[], next_cursor=None, has_more=False)
     
-    # Convert to Video objects and update with actual like counts
     videos = []
     for video_dict in videos_data:
         video_id = video_dict["id"]
         
-        # Update likes from storage if any
         like_count = len(likes_storage.get(video_id, set()))
         if like_count > 0:
             video_dict["stats"]["likes"] = like_count
         
         videos.append(Video(**video_dict))
     
-    # Next cursor is the timestamp of the last video in this batch
     last_video = videos[-1] if videos else None
     next_cursor = str(last_video.timestamp) if last_video and len(videos) == limit else None
     
-    # Determine if there are more videos
     has_more = False
     if last_video:
-        # Check if there's at least one more video with timestamp < last_video.timestamp
         for i in range(TOTAL_VIDEOS):
             video_timestamp = int(time.time() * 1000) - (i * 3600000)
             if video_timestamp < last_video.timestamp:
@@ -259,11 +233,9 @@ async def get_videos(
 async def like_video(video_id: str, action: LikeAction):
     """Like or unlike a video"""
     
-    # Validate video ID exists (don't parse index, just check format)
     if not video_id or len(video_id.split('_')) != 2:
         raise HTTPException(status_code=400, detail="Invalid video ID format")
     
-    # Initialize storage
     if video_id not in likes_storage:
         likes_storage[video_id] = set()
     
@@ -281,15 +253,37 @@ async def like_video(video_id: str, action: LikeAction):
         "likes_count": len(likes_storage[video_id])
     }
 
+@app.post("/videos/{video_id}/save")
+async def save_video(video_id: str, action: SaveAction):
+    """Save or unsave a video"""
+    
+    if not video_id or len(video_id.split('_')) != 2:
+        raise HTTPException(status_code=400, detail="Invalid video ID format")
+    
+    if video_id not in saves_storage:
+        saves_storage[video_id] = set()
+    
+    if action.action == "save":
+        saves_storage[video_id].add(CURRENT_USER_ID)
+        action_type = "saved"
+    else:
+        saves_storage[video_id].discard(CURRENT_USER_ID)
+        action_type = "unsaved"
+    
+    return {
+        "success": True,
+        "action": action_type,
+        "video_id": video_id,
+        "saves_count": len(saves_storage[video_id])
+    }
+
 @app.post("/videos/{video_id}/comments")
 async def add_comment(video_id: str, comment: CommentCreate):
     """Add a comment to a video"""
     
-    # Validate video ID
     if not video_id or len(video_id.split('_')) != 2:
         raise HTTPException(status_code=400, detail="Invalid video ID format")
     
-    # Create new comment
     new_comment = Comment(
         id=f"cmt_{int(time.time() * 1000)}_{random.randint(1000, 9999)}",
         user=CommentUser(
@@ -301,7 +295,6 @@ async def add_comment(video_id: str, comment: CommentCreate):
         time="Just now"
     )
     
-    # Store comment
     if video_id not in comments_storage:
         comments_storage[video_id] = []
     comments_storage[video_id].append(new_comment)
@@ -315,15 +308,12 @@ async def add_comment(video_id: str, comment: CommentCreate):
 async def get_comments(video_id: str):
     """Get comments for a video"""
     
-    # Validate video ID
     if not video_id or len(video_id.split('_')) != 2:
         raise HTTPException(status_code=400, detail="Invalid video ID format")
     
-    # Get comments from storage or generate mock
     if video_id in comments_storage:
         comments = comments_storage[video_id]
     else:
-        # Generate mock comments (max 3)
         comments = []
         mock_texts = [
             "This is amazing! 🔥",
@@ -352,25 +342,37 @@ async def get_comments(video_id: str):
 async def get_stats():
     """Get API statistics"""
     total_likes = sum(len(users) for users in likes_storage.values())
+    total_saves = sum(len(users) for users in saves_storage.values())
     total_comments = sum(len(comments) for comments in comments_storage.values())
-    
-    # Get first 5 videos to show cursor example
-    sample_videos = []
-    for i in range(min(5, TOTAL_VIDEOS)):
-        video = generate_video(i)
-        sample_videos.append({
-            "id": video["id"],
-            "timestamp": video["timestamp"],
-            "caption": video["caption"][:30] + "..."
-        })
     
     return {
         "total_videos": TOTAL_VIDEOS,
         "videos_with_likes": len(likes_storage),
         "total_likes": total_likes,
+        "videos_with_saves": len(saves_storage),
+        "total_saves": total_saves,
         "videos_with_comments": len(comments_storage),
         "total_comments": total_comments,
-        "pagination_type": "timestamp-based cursor",
-        "cursor_format": "Use timestamp from last video as cursor",
-        "sample_videos": sample_videos
+        "pagination_type": "timestamp-based cursor"
     }
+
+@app.get("/user/saved")
+async def get_saved_videos():
+    """Get saved videos for current user"""
+    saved_video_ids = [vid for vid, users in saves_storage.items() if CURRENT_USER_ID in users]
+    
+    saved_videos = []
+    for video_id in saved_video_ids[:20]:
+        try:
+            index = int(video_id.split('_')[1])
+            video = generate_video(index)
+            
+            like_count = len(likes_storage.get(video_id, set()))
+            if like_count > 0:
+                video["stats"]["likes"] = like_count
+            
+            saved_videos.append(Video(**video))
+        except (ValueError, IndexError):
+            continue
+    
+    return {"saved_videos": saved_videos}
