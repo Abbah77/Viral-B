@@ -2,7 +2,7 @@ services:
   - type: web
     name: viral-api
     runtime: python
-    repo: https://github.com/yourusername/your-repo
+    repo: https://github.com/Abbah77/Viral-B
     branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
