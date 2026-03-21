@@ -290,7 +290,7 @@ def generate_video(index: int, current_user_id: Optional[str] = None) -> dict:
     
     # Override likes count from storage if exists
     video_id = video["id"]
-    if storage.is_liked(video_id, current_user_id) if current_user_id else False:
+    if current_user_id and storage.is_liked(video_id, current_user_id):
         storage_likes = len(storage.likes.get(video_id, set()))
         if storage_likes > 0:
             video["stats"]["likes"] = storage_likes
@@ -361,7 +361,8 @@ async def verify_supabase_token(
         return {
             "id": payload["sub"],
             "email": payload["email"],
-            "user_metadata": payload.get("user_metadata", {})
+            "user_metadata": payload.get("user_metadata", {}),
+            "credentials": credentials  # Store credentials for Supabase calls
         }
         
     except jwt.ExpiredSignatureError:
@@ -678,8 +679,8 @@ async def get_profile(
         raise HTTPException(status_code=401, detail="Invalid or missing token")
     
     try:
-        # Fetch profile from Supabase
-        headers = {
+        # Prepare headers for Supabase request
+        supabase_headers = {
             "apikey": SUPABASE_ANON_KEY,
             "Authorization": f"Bearer {token_info['credentials'].credentials}"
         }
@@ -687,7 +688,7 @@ async def get_profile(
         # Get profile data
         profile_response = requests.get(
             f"{SUPABASE_URL}/rest/v1/profiles",
-            headers=headers,
+            headers=supabase_headers,
             params={"id": f"eq.{current_user_id}", "select": "*"}
         )
         
@@ -703,24 +704,29 @@ async def get_profile(
         # Get follower count
         followers_response = requests.get(
             f"{SUPABASE_URL}/rest/v1/follows",
-            headers=headers,
-            params={"following_id": f"eq.{current_user_id}", "select": "*", "limit": 0},
-            headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {token_info['credentials'].credentials}"}
+            headers=supabase_headers,
+            params={"following_id": f"eq.{current_user_id}", "select": "*", "limit": 0}
         )
-        follower_count = int(followers_response.headers.get("content-range", "0-0/0").split("/")[-1]) if followers_response.status_code == 200 else 0
+        follower_count = 0
+        if followers_response.status_code == 200:
+            content_range = followers_response.headers.get("content-range", "0-0/0")
+            follower_count = int(content_range.split("/")[-1]) if "/" in content_range else 0
         
         # Get following count
         following_response = requests.get(
             f"{SUPABASE_URL}/rest/v1/follows",
-            headers=headers,
+            headers=supabase_headers,
             params={"follower_id": f"eq.{current_user_id}", "select": "*", "limit": 0}
         )
-        following_count = int(following_response.headers.get("content-range", "0-0/0").split("/")[-1]) if following_response.status_code == 200 else 0
+        following_count = 0
+        if following_response.status_code == 200:
+            content_range = following_response.headers.get("content-range", "0-0/0")
+            following_count = int(content_range.split("/")[-1]) if "/" in content_range else 0
         
         # Get total likes received
         videos_response = requests.get(
             f"{SUPABASE_URL}/rest/v1/videos",
-            headers=headers,
+            headers=supabase_headers,
             params={"author_id": f"eq.{current_user_id}", "select": "likes_count"}
         )
         
