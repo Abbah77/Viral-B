@@ -9,6 +9,7 @@ from datetime import datetime
 # ==================== Models ====================
 
 class Author(BaseModel):
+    id: str
     name: str
     avatar: str
 
@@ -35,6 +36,9 @@ class LikeAction(BaseModel):
     action: str
 
 class SaveAction(BaseModel):
+    action: str
+
+class FollowAction(BaseModel):
     action: str
 
 class Video(BaseModel):
@@ -73,6 +77,7 @@ CURRENT_USER_ID = "user_001"
 # Storage
 likes_storage: Dict[str, Set[str]] = {}
 saves_storage: Dict[str, Set[str]] = {}
+follows_storage: Dict[str, Set[str]] = {}
 comments_storage: Dict[str, List[Comment]] = {}
 
 # Google video URLs (10 videos)
@@ -108,13 +113,37 @@ CAPTIONS = [
     "This is the content we need! 🙌"
 ]
 
-# Author
-AUTHOR = Author(
-    name="@tiktok_user",
-    avatar="https://randomuser.me/api/portraits/women/8.jpg"
-)
+# Author names pool
+AUTHOR_NAMES = [
+    "@tiktok_star", "@viral_creator", "@trending_now", "@daily_vibes", "@content_king",
+    "@viral_girl", "@funny_moments", "@dance_lord", "@music_lover", "@travel_bug"
+]
+
+AUTHOR_AVATARS = [
+    "https://randomuser.me/api/portraits/women/1.jpg",
+    "https://randomuser.me/api/portraits/men/2.jpg",
+    "https://randomuser.me/api/portraits/women/3.jpg",
+    "https://randomuser.me/api/portraits/men/4.jpg",
+    "https://randomuser.me/api/portraits/women/5.jpg",
+    "https://randomuser.me/api/portraits/men/6.jpg",
+    "https://randomuser.me/api/portraits/women/7.jpg",
+    "https://randomuser.me/api/portraits/men/8.jpg",
+    "https://randomuser.me/api/portraits/women/9.jpg",
+    "https://randomuser.me/api/portraits/men/10.jpg"
+]
 
 # ==================== Video Generation ====================
+
+def generate_author(index: int) -> Author:
+    """Generate a deterministic author based on index"""
+    author_index = index % len(AUTHOR_NAMES)
+    author_id = f"author_{author_index:03d}"
+    
+    return Author(
+        id=author_id,
+        name=AUTHOR_NAMES[author_index],
+        avatar=AUTHOR_AVATARS[author_index]
+    )
 
 def generate_video(index: int) -> dict:
     """Generate a single video with deterministic data"""
@@ -123,9 +152,15 @@ def generate_video(index: int) -> dict:
     
     random.seed(index)
     
+    author = generate_author(index)
+    author_id = author.id
+    
+    # Check if current user follows this author
+    is_following = author_id in follows_storage and CURRENT_USER_ID in follows_storage[author_id]
+    
     video = {
         "id": f"{timestamp}_{index:05d}",
-        "author": AUTHOR,
+        "author": author.dict(),
         "caption": CAPTIONS[index % len(CAPTIONS)],
         "hashtags": ["fyp", "viral", "trending", f"tag{index % 100}"][:random.randint(3, 5)],
         "video_url": VIDEO_POOL[index % len(VIDEO_POOL)],
@@ -135,7 +170,8 @@ def generate_video(index: int) -> dict:
             "comments": random.randint(100, 50000),
             "shares": random.randint(500, 200000)
         },
-        "timestamp": timestamp
+        "timestamp": timestamp,
+        "is_following": is_following
     }
     
     random.seed()
@@ -174,6 +210,7 @@ async def root():
             "videos": "GET /videos?limit=10&cursor=<timestamp>",
             "like": "POST /videos/{video_id}/like",
             "save": "POST /videos/{video_id}/save",
+            "follow": "POST /users/{user_id}/follow",
             "comments": "GET/POST /videos/{video_id}/comments",
             "health": "GET /health"
         }
@@ -205,10 +242,15 @@ async def get_videos(
     videos = []
     for video_dict in videos_data:
         video_id = video_dict["id"]
+        author_id = video_dict["author"]["id"]
         
+        # Update likes from storage
         like_count = len(likes_storage.get(video_id, set()))
         if like_count > 0:
             video_dict["stats"]["likes"] = like_count
+        
+        # Update is_following status
+        video_dict["is_following"] = author_id in follows_storage and CURRENT_USER_ID in follows_storage[author_id]
         
         videos.append(Video(**video_dict))
     
@@ -277,6 +319,52 @@ async def save_video(video_id: str, action: SaveAction):
         "saves_count": len(saves_storage[video_id])
     }
 
+@app.post("/users/{user_id}/follow")
+async def follow_user(user_id: str, action: FollowAction):
+    """Follow or unfollow a user"""
+    
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+    
+    if user_id not in follows_storage:
+        follows_storage[user_id] = set()
+    
+    if action.action == "follow":
+        follows_storage[user_id].add(CURRENT_USER_ID)
+        action_type = "followed"
+    else:
+        follows_storage[user_id].discard(CURRENT_USER_ID)
+        action_type = "unfollowed"
+    
+    return {
+        "success": True,
+        "action": action_type,
+        "user_id": user_id,
+        "followers_count": len(follows_storage[user_id])
+    }
+
+@app.get("/users/{user_id}/followers")
+async def get_followers(user_id: str):
+    """Get followers count for a user"""
+    
+    if user_id not in follows_storage:
+        return {"user_id": user_id, "followers": 0}
+    
+    return {"user_id": user_id, "followers": len(follows_storage[user_id])}
+
+@app.get("/users/{user_id}/following")
+async def get_following(user_id: str):
+    """Get following count for a user"""
+    
+    # For now, return mock data
+    # In real implementation, you'd count how many users this user follows
+    following_count = 0
+    for followers in follows_storage.values():
+        if user_id in followers:
+            following_count += 1
+    
+    return {"user_id": user_id, "following": following_count}
+
 @app.post("/videos/{video_id}/comments")
 async def add_comment(video_id: str, comment: CommentCreate):
     """Add a comment to a video"""
@@ -343,6 +431,7 @@ async def get_stats():
     """Get API statistics"""
     total_likes = sum(len(users) for users in likes_storage.values())
     total_saves = sum(len(users) for users in saves_storage.values())
+    total_follows = sum(len(users) for users in follows_storage.values())
     total_comments = sum(len(comments) for comments in comments_storage.values())
     
     return {
@@ -351,6 +440,8 @@ async def get_stats():
         "total_likes": total_likes,
         "videos_with_saves": len(saves_storage),
         "total_saves": total_saves,
+        "users_with_follows": len(follows_storage),
+        "total_follows": total_follows,
         "videos_with_comments": len(comments_storage),
         "total_comments": total_comments,
         "pagination_type": "timestamp-based cursor"
