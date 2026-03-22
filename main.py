@@ -14,18 +14,21 @@ from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Try to import AI service
+# ============================================================================
+# AI Service Import (with graceful fallback)
+# ============================================================================
+
 try:
-    from ai_service import ai_app  # ← CHANGE: no renaming
+    from ai_service import ai_app
     AI_SERVICE_AVAILABLE = True
     print("✅ AI Service loaded successfully")
 except ImportError as e:
     print(f"⚠️ AI Service not available: {e}")
     AI_SERVICE_AVAILABLE = False
     from fastapi import APIRouter
-    ai_app = APIRouter()  # ← CHANGE: fallback name
+    ai_app = APIRouter()
     
-    @ai_app.get("/ai/health")
+    @ai_app.get("/health")
     async def ai_health_fallback():
         return {"status": "disabled", "message": "AI service not available"}
 
@@ -38,6 +41,74 @@ VIDEOS_PER_PAGE = 10
 AI_SERVICE_ENABLED = True
 
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Pydantic Models (ALL MODELS DEFINED FIRST)
+# ============================================================================
+
+class Author(BaseModel):
+    id: str
+    name: str
+    avatar: str
+
+class Stats(BaseModel):
+    likes: int
+    comments: int
+    shares: int
+
+class Video(BaseModel):
+    id: str
+    author: Author
+    caption: str
+    hashtags: List[str]
+    video_url: str
+    thumbnail: str
+    stats: Stats
+    timestamp: int
+    is_following: bool = False
+    ai_score: Optional[float] = None
+
+class PaginatedResponse(BaseModel):
+    videos: List[Video]
+    next_cursor: Optional[str]
+    has_more: bool
+
+class CommentUser(BaseModel):
+    name: str
+    avatar: str
+
+class Comment(BaseModel):
+    id: str
+    user: CommentUser
+    text: str
+    likes: int
+    time: str
+
+class CommentCreate(BaseModel):
+    text: str = Field(..., min_length=1, max_length=500)
+
+class LikeAction(BaseModel):
+    action: str
+
+class SaveAction(BaseModel):
+    action: str
+
+class FollowAction(BaseModel):
+    action: str
+
+# ============================================================================
+# Storage (Now models are defined, so this works)
+# ============================================================================
+
+likes_storage: Dict[str, Set[str]] = {}
+saves_storage: Dict[str, Set[str]] = {}
+follows_storage: Dict[str, Set[str]] = {}
+comments_storage: Dict[str, List[Comment]] = {}
+
+# Cache for AI-scored videos
+ai_score_cache: Dict[str, Dict[str, float]] = {}
+ai_score_cache_timestamp: Dict[str, float] = {}
+AI_CACHE_TTL = 300  # 5 minutes
 
 # ============================================================================
 # App Setup
@@ -54,27 +125,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount AI app - THIS IS KEY
+# Mount AI app at /ai
 if AI_SERVICE_AVAILABLE:
-    app.mount("/ai", ai_app)  # ← CHANGE: use ai_app, not ai_router
+    app.mount("/ai", ai_app)
     print("✅ AI routes mounted at /ai")
 else:
-    app.include_router(ai_app)  # fallback
+    app.include_router(ai_app)
     print("⚠️ AI fallback routes mounted")
-
-# ============================================================================
-# Storage (In-memory)
-# ============================================================================
-
-likes_storage: Dict[str, Set[str]] = {}
-saves_storage: Dict[str, Set[str]] = {}
-follows_storage: Dict[str, Set[str]] = {}
-comments_storage: Dict[str, List[Comment]] = {}
-
-# Cache for AI-scored videos
-ai_score_cache: Dict[str, Dict[str, float]] = {}
-ai_score_cache_timestamp: Dict[str, float] = {}
-AI_CACHE_TTL = 300
 
 # ============================================================================
 # Video Data (Mock)
@@ -156,6 +213,7 @@ async def fetch_ai_scores(user_id: str) -> Dict[str, float]:
     if not AI_SERVICE_ENABLED:
         return {}
     
+    # Check cache
     now = time.time()
     if user_id in ai_score_cache_timestamp:
         if now - ai_score_cache_timestamp[user_id] < AI_CACHE_TTL:
@@ -195,22 +253,26 @@ def get_videos(cursor_timestamp: Optional[int], limit: int, current_user_id: Opt
                 start_index = i
                 break
     
+    # Generate base videos
     for i in range(start_index, min(start_index + limit * 2, TOTAL_VIDEOS)):
         videos.append(generate_video(i, current_user_id))
     
+    # Try to reorder by AI scores if user is authenticated
     if current_user_id and AI_SERVICE_ENABLED:
         try:
-            import asyncio
+            # Fetch AI scores
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             ai_scores = loop.run_until_complete(fetch_ai_scores(current_user_id))
             loop.close()
             
             if ai_scores:
+                # Sort videos by AI score (higher score first)
                 videos.sort(
                     key=lambda v: ai_scores.get(v['id'], 0),
                     reverse=True
                 )
+                # Add AI score to video objects
                 for v in videos:
                     v['ai_score'] = ai_scores.get(v['id'])
         except Exception as e:
@@ -246,7 +308,7 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    return {"status": "healthy", "ai_available": AI_SERVICE_AVAILABLE}
 
 @app.get("/videos", response_model=PaginatedResponse)
 async def get_videos_endpoint(
@@ -254,6 +316,8 @@ async def get_videos_endpoint(
     cursor: Optional[str] = Query(None),
     user_id: Optional[str] = Query(None)
 ):
+    """Get videos - pass user_id to get personalized ordering"""
+    
     cursor_timestamp = int(cursor) if cursor else None
     videos_data = get_videos(cursor_timestamp, limit, user_id)
     
@@ -277,6 +341,8 @@ async def like_video(
     action: LikeAction,
     user_id: str = Query(..., description="Current user ID")
 ):
+    """Like or unlike a video"""
+    
     if not video_id:
         raise HTTPException(400, "Invalid video ID")
     
@@ -296,6 +362,8 @@ async def save_video(
     action: SaveAction,
     user_id: str = Query(..., description="Current user ID")
 ):
+    """Save or unsave a video"""
+    
     if action.action == "save":
         if video_id not in saves_storage:
             saves_storage[video_id] = set()
@@ -312,6 +380,8 @@ async def follow_user(
     action: FollowAction,
     follower_id: str = Query(..., description="Current user ID")
 ):
+    """Follow or unfollow a user"""
+    
     if target_user_id == follower_id:
         raise HTTPException(400, "You cannot follow yourself")
     
@@ -330,9 +400,11 @@ async def add_comment(
     video_id: str,
     comment: CommentCreate,
     user_id: str = Query(..., description="Current user ID"),
-    user_name: Optional[str] = Query(None),
-    user_avatar: Optional[str] = Query(None)
+    user_name: Optional[str] = Query(None, description="User's display name"),
+    user_avatar: Optional[str] = Query(None, description="User's avatar URL")
 ):
+    """Add a comment"""
+    
     new_comment = Comment(
         id=f"cmt_{int(time.time() * 1000)}",
         user=CommentUser(
@@ -352,10 +424,12 @@ async def add_comment(
 
 @app.get("/videos/{video_id}/comments")
 async def get_comments(video_id: str):
+    """Get comments for a video"""
     return {"comments": comments_storage.get(video_id, [])}
 
 @app.get("/user/saved")
 async def get_saved_videos(user_id: str = Query(..., description="Current user ID")):
+    """Get saved videos for user"""
     saved_video_ids = [vid for vid, users in saves_storage.items() if user_id in users]
     
     saved_videos = []
@@ -371,6 +445,7 @@ async def get_saved_videos(user_id: str = Query(..., description="Current user I
 
 @app.get("/stats")
 async def get_stats():
+    """Get app statistics"""
     return {
         "total_videos": TOTAL_VIDEOS,
         "total_likes": sum(len(u) for u in likes_storage.values()),
@@ -380,3 +455,7 @@ async def get_stats():
         "ai_enabled": AI_SERVICE_ENABLED,
         "ai_available": AI_SERVICE_AVAILABLE
     }
+
+# ============================================================================
+# Run with: uvicorn main:app --reload --port 8000
+# ============================================================================
