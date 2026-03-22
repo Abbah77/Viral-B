@@ -5,6 +5,7 @@ Integrates with the existing ai.py recommendation engine
 
 import asyncio
 import logging
+import os
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
@@ -16,8 +17,6 @@ from contextlib import asynccontextmanager
 from ai import (
     ProductionConfig, 
     FeedService,
-    ScoringEngine,
-    logger as ai_logger
 )
 
 # ============================================================================
@@ -54,12 +53,6 @@ class AIBatchResponse(BaseModel):
     processed_count: int
     errors: List[str] = []
 
-class AIPersonalizedFeedRequest(BaseModel):
-    """Request for personalized feed"""
-    user_id: str
-    limit: int = Field(20, ge=1, le=100)
-    include_scores: bool = Field(False)
-
 class AIVideoScore(BaseModel):
     """Scored video from AI"""
     video_id: str
@@ -72,7 +65,7 @@ class AIVideoScore(BaseModel):
 class AIPersonalizedFeedResponse(BaseModel):
     """Personalized feed response"""
     feed: List[AIVideoScore]
-    source: str  # 'personalized', 'trending', 'cold_start'
+    source: str
     latency_ms: float
     cached: bool
     candidates_generated: int
@@ -107,6 +100,12 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Initializing AI Service...")
     try:
         config = ProductionConfig()
+        
+        # Override Redis URL from environment
+        redis_url = os.environ.get('REDIS_URL', config.redis_url)
+        config.redis_url = redis_url
+        logger.info(f"Using Redis URL: {redis_url.replace('://', '://***@') if '@' in redis_url else redis_url[:20]}...")
+        
         ai_feed_service = FeedService(config)
         await ai_feed_service.initialize()
         logger.info("✅ AI Service initialized successfully")
@@ -154,10 +153,9 @@ def get_ai_service():
 
 def signal_type_to_ai_format(signal: AISignal) -> Dict:
     """Convert frontend signal format to AI engine format"""
-    # Map signal types to AI engine interaction types
     type_mapping = {
         'complete_watch': 'complete_watch',
-        'rewatch': 'watch_75pct',  # Treat rewatch as high engagement
+        'rewatch': 'watch_75pct',
         'like': 'like',
         'unlike': 'unlike',
         'comment': 'comment',
@@ -166,20 +164,20 @@ def signal_type_to_ai_format(signal: AISignal) -> Dict:
         'unsave': 'unsave',
         'follow_after_view': 'follow',
         'unfollow': 'unfollow',
-        'profile_visit': 'like',  # Profile visit shows interest
-        'seek_forward': 'watch_75pct',  # Seeking forward = engaged
-        'seek_back': 'watch_75pct',    # Seeking back = re-engagement
+        'profile_visit': 'like',
+        'seek_forward': 'watch_75pct',
+        'seek_back': 'watch_75pct',
         'skip': 'skip_early',
-        'watch_time': 'watch_50pct',   # Generic watch time
+        'watch_time': 'watch_50pct',
     }
     
     interaction_type = type_mapping.get(signal.signal_type, signal.signal_type)
     
     return {
         'type': interaction_type,
-        'creator_id': None,  # Will be looked up from video metadata
-        'category': None,    # Will be looked up
-        'tags': [],          # Will be looked up
+        'creator_id': None,
+        'category': None,
+        'tags': [],
         'watch_time': signal.value or 0,
         'duration': signal.video_duration or 60,
         'timestamp': signal.timestamp / 1000 if signal.timestamp > 9999999999 else signal.timestamp
@@ -214,10 +212,7 @@ async def process_batch_signals(
     request: AIBatchRequest,
     background_tasks: BackgroundTasks
 ):
-    """
-    Process batch of user interaction signals for AI learning.
-    Signals are processed asynchronously in background.
-    """
+    """Process batch of user interaction signals for AI learning."""
     service = get_ai_service()
     errors = []
     processed = 0
@@ -226,50 +221,32 @@ async def process_batch_signals(
         nonlocal processed
         for signal in request.signals:
             try:
-                # Convert to AI engine format
                 interaction = signal_type_to_ai_format(signal)
                 
-                # Determine reward based on signal type
                 reward_map = {
-                    'complete_watch': 1.0,
-                    'rewatch': 0.9,
-                    'like': 0.8,
-                    'comment': 0.7,
-                    'share': 1.0,
-                    'save': 0.85,
-                    'follow_after_view': 1.0,
-                    'profile_visit': 0.5,
-                    'seek_forward': 0.4,
-                    'seek_back': 0.4,
-                    'watch_time': 0.3,
-                    'unlike': 0.0,
-                    'unsave': 0.0,
-                    'unfollow': 0.0,
-                    'skip': 0.0,
+                    'complete_watch': 1.0, 'rewatch': 0.9, 'like': 0.8,
+                    'comment': 0.7, 'share': 1.0, 'save': 0.85,
+                    'follow_after_view': 1.0, 'profile_visit': 0.5,
+                    'seek_forward': 0.4, 'seek_back': 0.4, 'watch_time': 0.3,
+                    'unlike': 0.0, 'unsave': 0.0, 'unfollow': 0.0, 'skip': 0.0,
                 }
                 
                 reward = reward_map.get(signal.signal_type, 0.5)
                 
-                # Update user profile in AI engine
                 await service.user_profiles.update_profile(
-                    signal.user_id,
-                    interaction,
-                    reward
+                    signal.user_id, interaction, reward
                 )
                 
-                # Update video analytics
                 await service.video_analytics.update_stats(
-                    signal.video_id,
-                    signal.signal_type
+                    signal.video_id, signal.signal_type
                 )
                 
                 processed += 1
                 
             except Exception as e:
-                logger.error(f"Error processing signal {signal.signal_type} for video {signal.video_id}: {e}")
+                logger.error(f"Error processing signal: {e}")
                 errors.append(f"{signal.signal_type}:{signal.video_id}:{str(e)}")
     
-    # Process in background to not block
     background_tasks.add_task(process_signals)
     
     return AIBatchResponse(
@@ -284,10 +261,7 @@ async def get_personalized_feed(
     limit: int = Query(20, ge=1, le=100),
     include_scores: bool = Query(False)
 ):
-    """
-    Get personalized video feed for a user.
-    Returns video IDs ranked by AI score.
-    """
+    """Get personalized video feed for a user."""
     service = get_ai_service()
     
     try:
@@ -318,38 +292,30 @@ async def get_personalized_feed(
         )
         
     except Exception as e:
-        logger.error(f"Error generating feed for user {user_id}: {e}")
+        logger.error(f"Error generating feed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @ai_app.get("/ai/user/{user_id}/profile", response_model=AIUserProfileResponse)
 async def get_user_profile(user_id: str):
-    """
-    Get AI user profile with interests and affinities
-    """
+    """Get AI user profile with interests and affinities"""
     service = get_ai_service()
     
     try:
         profile = await service.user_profiles.get_profile(user_id)
         
-        # Extract top interests
         interests = sorted(
             [{"tag": k, "score": v} for k, v in profile.get('interests', {}).items()],
-            key=lambda x: x['score'],
-            reverse=True
+            key=lambda x: x['score'], reverse=True
         )[:10]
         
-        # Extract top creators
         creators = sorted(
             [{"creator_id": k, "score": v} for k, v in profile.get('creator_affinity', {}).items()],
-            key=lambda x: x['score'],
-            reverse=True
+            key=lambda x: x['score'], reverse=True
         )[:10]
         
-        # Extract top categories
         categories = sorted(
             [{"category": k, "score": v} for k, v in profile.get('category_affinity', {}).items()],
-            key=lambda x: x['score'],
-            reverse=True
+            key=lambda x: x['score'], reverse=True
         )[:10]
         
         return AIUserProfileResponse(
@@ -363,21 +329,19 @@ async def get_user_profile(user_id: str):
         )
         
     except Exception as e:
-        logger.error(f"Error getting profile for user {user_id}: {e}")
+        logger.error(f"Error getting profile: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @ai_app.post("/ai/video/{video_id}/interaction")
 async def record_single_interaction(
     video_id: str,
-    user_id: str = Query(...),
-    interaction_type: str = Query(...),
-    watch_time: float = Query(0),
-    duration: float = Query(60),
-    background_tasks: BackgroundTasks
+    user_id: str = Query(..., description="Current user ID"),
+    interaction_type: str = Query(..., description="Type of interaction"),
+    watch_time: float = Query(0, description="Watch time in seconds"),
+    duration: float = Query(60, description="Video duration"),
+    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
-    """
-    Record a single interaction (alternative to batch endpoint)
-    """
+    """Record a single interaction (alternative to batch endpoint)"""
     service = get_ai_service()
     
     async def record():
@@ -394,10 +358,10 @@ async def record_single_interaction(
     return {"success": True, "message": "Interaction recorded"}
 
 @ai_app.get("/ai/trending")
-async def get_trending_videos(limit: int = Query(50, ge=1, le=200)):
-    """
-    Get globally trending videos from AI
-    """
+async def get_trending_videos(
+    limit: int = Query(50, ge=1, le=200)
+):
+    """Get globally trending videos from AI"""
     service = get_ai_service()
     
     try:
@@ -411,12 +375,11 @@ async def get_trending_videos(limit: int = Query(50, ge=1, le=200)):
             ]
         }
     except Exception as e:
-        logger.error(f"Error getting trending videos: {e}")
+        logger.error(f"Error getting trending: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================================
-# Router for mounting in main.py
+# Router for mounting
 # ============================================================================
 
-# This router will be imported and mounted in main.py
 ai_router = ai_app
