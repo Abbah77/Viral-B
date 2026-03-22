@@ -382,4 +382,4 @@ async def get_trending_videos(
 # Router for mounting
 # ============================================================================
 
-ai_router = ai_app
+ai_app = ai_app
