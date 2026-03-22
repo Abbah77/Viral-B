@@ -1,4 +1,27 @@
+# Core
 fastapi
 uvicorn[standard]
-pydantic
 python-multipart
+
+# HTTP
+aiohttp
+httpx
+
+# Database & Cache
+redis
+async-timeout
+
+# AI/ML
+torch
+numpy
+scikit-learn
+
+# Data Validation
+pydantic
+pydantic-settings
+
+# Utils
+python-dotenv
+click
+loguru
+aiofiles
