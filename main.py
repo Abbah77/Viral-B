@@ -1,15 +1,20 @@
 """
-Viral App - Backend API (Simplified)
+Viral App - Backend API with AI Integration
 No JWT required - just pass user ID from frontend
 """
 
 import time
 import random
+import asyncio
+import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Set
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+# Import AI service
+from ai_service import ai_router
 
 # ============================================================================
 # Configuration
@@ -17,6 +22,11 @@ from pydantic import BaseModel, Field
 
 TOTAL_VIDEOS = 10000
 VIDEOS_PER_PAGE = 10
+
+# AI Service URL (for internal calls)
+AI_SERVICE_ENABLED = True  # Set to False to disable AI fallback
+
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # Pydantic Models
@@ -42,6 +52,7 @@ class Video(BaseModel):
     stats: Stats
     timestamp: int
     is_following: bool = False
+    ai_score: Optional[float] = None  # AI score if available
 
 class PaginatedResponse(BaseModel):
     videos: List[Video]
@@ -86,8 +97,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount AI routes under /ai
+app.include_router(ai_router)
+
 # ============================================================================
-# Storage (In-memory)
+# Storage (In-memory - will be replaced with Redis/Supabase)
 # ============================================================================
 
 likes_storage: Dict[str, Set[str]] = {}
@@ -95,8 +109,13 @@ saves_storage: Dict[str, Set[str]] = {}
 follows_storage: Dict[str, Set[str]] = {}
 comments_storage: Dict[str, List[Comment]] = {}
 
+# Cache for AI-scored videos
+ai_score_cache: Dict[str, Dict[str, float]] = {}  # user_id -> {video_id: score}
+ai_score_cache_timestamp: Dict[str, float] = {}  # user_id -> last update
+AI_CACHE_TTL = 300  # 5 minutes
+
 # ============================================================================
-# Video Data
+# Video Data (Mock for now)
 # ============================================================================
 
 VIDEO_POOL = [
@@ -135,7 +154,7 @@ def generate_author(index: int) -> Author:
         avatar=AUTHOR_AVATARS[author_index]
     )
 
-def generate_video(index: int, current_user_id: Optional[str] = None) -> dict:
+def generate_video(index: int, current_user_id: Optional[str] = None, ai_score: Optional[float] = None) -> dict:
     current_time = int(time.time() * 1000)
     timestamp = current_time - (index * 3600000)
     
@@ -159,7 +178,8 @@ def generate_video(index: int, current_user_id: Optional[str] = None) -> dict:
             "shares": random.randint(500, 20000)
         },
         "timestamp": timestamp,
-        "is_following": is_following
+        "is_following": is_following,
+        "ai_score": ai_score
     }
     
     # Override with actual likes from storage
@@ -170,7 +190,40 @@ def generate_video(index: int, current_user_id: Optional[str] = None) -> dict:
     random.seed()
     return video
 
+async def fetch_ai_scores(user_id: str) -> Dict[str, float]:
+    """Fetch personalized video scores from AI service"""
+    if not AI_SERVICE_ENABLED:
+        return {}
+    
+    # Check cache
+    now = time.time()
+    if user_id in ai_score_cache_timestamp:
+        if now - ai_score_cache_timestamp[user_id] < AI_CACHE_TTL:
+            return ai_score_cache.get(user_id, {})
+    
+    try:
+        # Call AI service
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://localhost:8000/ai/feed/{user_id}?limit=100") as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    scores = {}
+                    for item in data.get('feed', []):
+                        scores[item['video_id']] = item['score']
+                    
+                    # Update cache
+                    ai_score_cache[user_id] = scores
+                    ai_score_cache_timestamp[user_id] = now
+                    
+                    return scores
+    except Exception as e:
+        logger.error(f"Failed to fetch AI scores for {user_id}: {e}")
+    
+    return {}
+
 def get_videos(cursor_timestamp: Optional[int], limit: int, current_user_id: Optional[str] = None) -> List[dict]:
+    """Get videos, optionally reordered by AI scores"""
     videos = []
     
     if cursor_timestamp is None:
@@ -183,10 +236,35 @@ def get_videos(cursor_timestamp: Optional[int], limit: int, current_user_id: Opt
                 start_index = i
                 break
     
-    for i in range(start_index, min(start_index + limit, TOTAL_VIDEOS)):
+    # Generate base videos
+    for i in range(start_index, min(start_index + limit * 2, TOTAL_VIDEOS)):
         videos.append(generate_video(i, current_user_id))
     
-    return videos
+    # Try to reorder by AI scores if user is authenticated
+    if current_user_id and AI_SERVICE_ENABLED:
+        try:
+            # Fetch AI scores asynchronously (we need to run it synchronously here)
+            # In production, this should be handled differently
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            ai_scores = loop.run_until_complete(fetch_ai_scores(current_user_id))
+            loop.close()
+            
+            if ai_scores:
+                # Sort videos by AI score (higher score first)
+                videos.sort(
+                    key=lambda v: ai_scores.get(v['id'], 0),
+                    reverse=True
+                )
+                
+                # Add AI score to video objects
+                for v in videos:
+                    v['ai_score'] = ai_scores.get(v['id'])
+        except Exception as e:
+            logger.error(f"Error applying AI ordering: {e}")
+    
+    return videos[:limit]
 
 # ============================================================================
 # API Endpoints
@@ -197,12 +275,19 @@ async def root():
     return {
         "message": "Viral API is running",
         "status": "healthy",
+        "ai_enabled": AI_SERVICE_ENABLED,
         "endpoints": {
             "videos": "GET /videos?limit=10&cursor=<timestamp>",
             "like": "POST /videos/{video_id}/like?user_id=xxx&action=like|unlike",
             "save": "POST /videos/{video_id}/save?user_id=xxx&action=save|unsave",
             "follow": "POST /users/{user_id}/follow?follower_id=xxx&action=follow|unfollow",
             "comments": "GET/POST /videos/{video_id}/comments?user_id=xxx",
+            "ai": {
+                "batch": "POST /ai/batch",
+                "feed": "GET /ai/feed/{user_id}",
+                "profile": "GET /ai/user/{user_id}/profile",
+                "health": "GET /ai/health"
+            }
         }
     }
 
@@ -216,7 +301,7 @@ async def get_videos_endpoint(
     cursor: Optional[str] = Query(None),
     user_id: Optional[str] = Query(None)
 ):
-    """Get videos - pass user_id to get following status"""
+    """Get videos - pass user_id to get personalized ordering"""
     
     cursor_timestamp = int(cursor) if cursor else None
     
@@ -251,6 +336,27 @@ async def like_video(
         if video_id not in likes_storage:
             likes_storage[video_id] = set()
         likes_storage[video_id].add(user_id)
+        
+        # Also send to AI (fire and forget)
+        if AI_SERVICE_ENABLED:
+            try:
+                import aiohttp
+                async def send_to_ai():
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(
+                            "http://localhost:8000/ai/video/{video_id}/interaction",
+                            params={
+                                "user_id": user_id,
+                                "interaction_type": "like",
+                                "watch_time": 0,
+                                "duration": 60
+                            }
+                        )
+                # Fire and forget
+                asyncio.create_task(send_to_ai())
+            except:
+                pass
+        
         return {"success": True, "action": "liked", "likes_count": len(likes_storage[video_id])}
     else:
         if video_id in likes_storage:
@@ -290,6 +396,26 @@ async def follow_user(
         if target_user_id not in follows_storage:
             follows_storage[target_user_id] = set()
         follows_storage[target_user_id].add(follower_id)
+        
+        # Send to AI
+        if AI_SERVICE_ENABLED:
+            try:
+                import aiohttp
+                async def send_to_ai():
+                    async with aiohttp.ClientSession() as session:
+                        await session.post(
+                            "http://localhost:8000/ai/video/{video_id}/interaction",
+                            params={
+                                "user_id": follower_id,
+                                "interaction_type": "follow_after_view",
+                                "watch_time": 0,
+                                "duration": 60
+                            }
+                        )
+                asyncio.create_task(send_to_ai())
+            except:
+                pass
+        
         return {"success": True, "action": "followed", "followers_count": len(follows_storage[target_user_id])}
     else:
         if target_user_id in follows_storage:
@@ -321,6 +447,25 @@ async def add_comment(
         comments_storage[video_id] = []
     comments_storage[video_id].insert(0, new_comment)
     
+    # Send to AI
+    if AI_SERVICE_ENABLED:
+        try:
+            import aiohttp
+            async def send_to_ai():
+                async with aiohttp.ClientSession() as session:
+                    await session.post(
+                        "http://localhost:8000/ai/video/{video_id}/interaction",
+                        params={
+                            "user_id": user_id,
+                            "interaction_type": "comment",
+                            "watch_time": 0,
+                            "duration": 60
+                        }
+                    )
+            asyncio.create_task(send_to_ai())
+        except:
+            pass
+    
     return {"success": True, "comment": new_comment}
 
 @app.get("/videos/{video_id}/comments")
@@ -351,5 +496,10 @@ async def get_stats():
         "total_likes": sum(len(u) for u in likes_storage.values()),
         "total_saves": sum(len(u) for u in saves_storage.values()),
         "total_follows": sum(len(u) for u in follows_storage.values()),
-        "total_comments": sum(len(c) for c in comments_storage.values())
+        "total_comments": sum(len(c) for c in comments_storage.values()),
+        "ai_enabled": AI_SERVICE_ENABLED
     }
+
+# ============================================================================
+# Run with: uvicorn main:app --reload --port 8000
+# ============================================================================
