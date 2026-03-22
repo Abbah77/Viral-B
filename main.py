@@ -7,14 +7,27 @@ import time
 import random
 import asyncio
 import logging
+import os
 from datetime import datetime
 from typing import Optional, List, Dict, Set
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Import AI service
-from ai_service import ai_router
+# Try to import AI service (will fail gracefully if not available)
+try:
+    from ai_service import ai_app as ai_router
+    AI_SERVICE_AVAILABLE = True
+    print("✅ AI Service loaded successfully")
+except ImportError as e:
+    print(f"⚠️ AI Service not available: {e}")
+    AI_SERVICE_AVAILABLE = False
+    from fastapi import APIRouter
+    ai_router = APIRouter()
+    
+    @ai_router.get("/ai/health")
+    async def ai_health_fallback():
+        return {"status": "disabled", "message": "AI service not available"}
 
 # ============================================================================
 # Configuration
@@ -24,7 +37,7 @@ TOTAL_VIDEOS = 10000
 VIDEOS_PER_PAGE = 10
 
 # AI Service URL (for internal calls)
-AI_SERVICE_ENABLED = True  # Set to False to disable AI fallback
+AI_SERVICE_ENABLED = True
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +65,7 @@ class Video(BaseModel):
     stats: Stats
     timestamp: int
     is_following: bool = False
-    ai_score: Optional[float] = None  # AI score if available
+    ai_score: Optional[float] = None
 
 class PaginatedResponse(BaseModel):
     videos: List[Video]
@@ -97,11 +110,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount AI routes under /ai
-app.include_router(ai_router)
+# Mount AI routes (ai_router is a FastAPI app, we need to mount it)
+# In FastAPI, to mount a sub-app, use app.mount() not include_router()
+if AI_SERVICE_AVAILABLE:
+    app.mount("/ai", ai_router)
+    print("✅ AI routes mounted at /ai")
+else:
+    # If AI not available, still mount fallback routes
+    app.include_router(ai_router)
 
 # ============================================================================
-# Storage (In-memory - will be replaced with Redis/Supabase)
+# Storage (In-memory)
 # ============================================================================
 
 likes_storage: Dict[str, Set[str]] = {}
@@ -110,12 +129,12 @@ follows_storage: Dict[str, Set[str]] = {}
 comments_storage: Dict[str, List[Comment]] = {}
 
 # Cache for AI-scored videos
-ai_score_cache: Dict[str, Dict[str, float]] = {}  # user_id -> {video_id: score}
-ai_score_cache_timestamp: Dict[str, float] = {}  # user_id -> last update
-AI_CACHE_TTL = 300  # 5 minutes
+ai_score_cache: Dict[str, Dict[str, float]] = {}
+ai_score_cache_timestamp: Dict[str, float] = {}
+AI_CACHE_TTL = 300
 
 # ============================================================================
-# Video Data (Mock for now)
+# Video Data (Mock)
 # ============================================================================
 
 VIDEO_POOL = [
@@ -182,7 +201,6 @@ def generate_video(index: int, current_user_id: Optional[str] = None, ai_score: 
         "ai_score": ai_score
     }
     
-    # Override with actual likes from storage
     video_id = video["id"]
     if video_id in likes_storage:
         video["stats"]["likes"] = len(likes_storage[video_id])
@@ -195,27 +213,25 @@ async def fetch_ai_scores(user_id: str) -> Dict[str, float]:
     if not AI_SERVICE_ENABLED:
         return {}
     
-    # Check cache
     now = time.time()
     if user_id in ai_score_cache_timestamp:
         if now - ai_score_cache_timestamp[user_id] < AI_CACHE_TTL:
             return ai_score_cache.get(user_id, {})
     
     try:
-        # Call AI service
         import aiohttp
+        # Use environment variable for AI service URL, fallback to localhost
+        ai_url = os.environ.get('AI_SERVICE_URL', 'http://localhost:8000')
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"http://localhost:8000/ai/feed/{user_id}?limit=100") as resp:
+            async with session.get(f"{ai_url}/ai/feed/{user_id}?limit=100") as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     scores = {}
                     for item in data.get('feed', []):
                         scores[item['video_id']] = item['score']
                     
-                    # Update cache
                     ai_score_cache[user_id] = scores
                     ai_score_cache_timestamp[user_id] = now
-                    
                     return scores
     except Exception as e:
         logger.error(f"Failed to fetch AI scores for {user_id}: {e}")
@@ -236,15 +252,11 @@ def get_videos(cursor_timestamp: Optional[int], limit: int, current_user_id: Opt
                 start_index = i
                 break
     
-    # Generate base videos
     for i in range(start_index, min(start_index + limit * 2, TOTAL_VIDEOS)):
         videos.append(generate_video(i, current_user_id))
     
-    # Try to reorder by AI scores if user is authenticated
     if current_user_id and AI_SERVICE_ENABLED:
         try:
-            # Fetch AI scores asynchronously (we need to run it synchronously here)
-            # In production, this should be handled differently
             import asyncio
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -252,13 +264,10 @@ def get_videos(cursor_timestamp: Optional[int], limit: int, current_user_id: Opt
             loop.close()
             
             if ai_scores:
-                # Sort videos by AI score (higher score first)
                 videos.sort(
                     key=lambda v: ai_scores.get(v['id'], 0),
                     reverse=True
                 )
-                
-                # Add AI score to video objects
                 for v in videos:
                     v['ai_score'] = ai_scores.get(v['id'])
         except Exception as e:
@@ -276,6 +285,7 @@ async def root():
         "message": "Viral API is running",
         "status": "healthy",
         "ai_enabled": AI_SERVICE_ENABLED,
+        "ai_available": AI_SERVICE_AVAILABLE,
         "endpoints": {
             "videos": "GET /videos?limit=10&cursor=<timestamp>",
             "like": "POST /videos/{video_id}/like?user_id=xxx&action=like|unlike",
@@ -301,10 +311,7 @@ async def get_videos_endpoint(
     cursor: Optional[str] = Query(None),
     user_id: Optional[str] = Query(None)
 ):
-    """Get videos - pass user_id to get personalized ordering"""
-    
     cursor_timestamp = int(cursor) if cursor else None
-    
     videos_data = get_videos(cursor_timestamp, limit, user_id)
     
     if not videos_data:
@@ -327,8 +334,6 @@ async def like_video(
     action: LikeAction,
     user_id: str = Query(..., description="Current user ID")
 ):
-    """Like or unlike a video"""
-    
     if not video_id:
         raise HTTPException(400, "Invalid video ID")
     
@@ -336,27 +341,6 @@ async def like_video(
         if video_id not in likes_storage:
             likes_storage[video_id] = set()
         likes_storage[video_id].add(user_id)
-        
-        # Also send to AI (fire and forget)
-        if AI_SERVICE_ENABLED:
-            try:
-                import aiohttp
-                async def send_to_ai():
-                    async with aiohttp.ClientSession() as session:
-                        await session.post(
-                            "http://localhost:8000/ai/video/{video_id}/interaction",
-                            params={
-                                "user_id": user_id,
-                                "interaction_type": "like",
-                                "watch_time": 0,
-                                "duration": 60
-                            }
-                        )
-                # Fire and forget
-                asyncio.create_task(send_to_ai())
-            except:
-                pass
-        
         return {"success": True, "action": "liked", "likes_count": len(likes_storage[video_id])}
     else:
         if video_id in likes_storage:
@@ -369,8 +353,6 @@ async def save_video(
     action: SaveAction,
     user_id: str = Query(..., description="Current user ID")
 ):
-    """Save or unsave a video"""
-    
     if action.action == "save":
         if video_id not in saves_storage:
             saves_storage[video_id] = set()
@@ -387,8 +369,6 @@ async def follow_user(
     action: FollowAction,
     follower_id: str = Query(..., description="Current user ID")
 ):
-    """Follow or unfollow a user"""
-    
     if target_user_id == follower_id:
         raise HTTPException(400, "You cannot follow yourself")
     
@@ -396,26 +376,6 @@ async def follow_user(
         if target_user_id not in follows_storage:
             follows_storage[target_user_id] = set()
         follows_storage[target_user_id].add(follower_id)
-        
-        # Send to AI
-        if AI_SERVICE_ENABLED:
-            try:
-                import aiohttp
-                async def send_to_ai():
-                    async with aiohttp.ClientSession() as session:
-                        await session.post(
-                            "http://localhost:8000/ai/video/{video_id}/interaction",
-                            params={
-                                "user_id": follower_id,
-                                "interaction_type": "follow_after_view",
-                                "watch_time": 0,
-                                "duration": 60
-                            }
-                        )
-                asyncio.create_task(send_to_ai())
-            except:
-                pass
-        
         return {"success": True, "action": "followed", "followers_count": len(follows_storage[target_user_id])}
     else:
         if target_user_id in follows_storage:
@@ -427,11 +387,9 @@ async def add_comment(
     video_id: str,
     comment: CommentCreate,
     user_id: str = Query(..., description="Current user ID"),
-    user_name: Optional[str] = Query(None, description="User's display name"),
-    user_avatar: Optional[str] = Query(None, description="User's avatar URL")
+    user_name: Optional[str] = Query(None),
+    user_avatar: Optional[str] = Query(None)
 ):
-    """Add a comment"""
-    
     new_comment = Comment(
         id=f"cmt_{int(time.time() * 1000)}",
         user=CommentUser(
@@ -447,35 +405,14 @@ async def add_comment(
         comments_storage[video_id] = []
     comments_storage[video_id].insert(0, new_comment)
     
-    # Send to AI
-    if AI_SERVICE_ENABLED:
-        try:
-            import aiohttp
-            async def send_to_ai():
-                async with aiohttp.ClientSession() as session:
-                    await session.post(
-                        "http://localhost:8000/ai/video/{video_id}/interaction",
-                        params={
-                            "user_id": user_id,
-                            "interaction_type": "comment",
-                            "watch_time": 0,
-                            "duration": 60
-                        }
-                    )
-            asyncio.create_task(send_to_ai())
-        except:
-            pass
-    
     return {"success": True, "comment": new_comment}
 
 @app.get("/videos/{video_id}/comments")
 async def get_comments(video_id: str):
-    """Get comments for a video"""
     return {"comments": comments_storage.get(video_id, [])}
 
 @app.get("/user/saved")
 async def get_saved_videos(user_id: str = Query(..., description="Current user ID")):
-    """Get saved videos for user"""
     saved_video_ids = [vid for vid, users in saves_storage.items() if user_id in users]
     
     saved_videos = []
@@ -497,9 +434,6 @@ async def get_stats():
         "total_saves": sum(len(u) for u in saves_storage.values()),
         "total_follows": sum(len(u) for u in follows_storage.values()),
         "total_comments": sum(len(c) for c in comments_storage.values()),
-        "ai_enabled": AI_SERVICE_ENABLED
+        "ai_enabled": AI_SERVICE_ENABLED,
+        "ai_available": AI_SERVICE_AVAILABLE
     }
-
-# ============================================================================
-# Run with: uvicorn main:app --reload --port 8000
-# ============================================================================
