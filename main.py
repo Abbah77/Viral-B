@@ -14,18 +14,18 @@ from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Try to import AI service (will fail gracefully if not available)
+# Try to import AI service
 try:
-    from ai_service import ai_app as ai_router
+    from ai_service import ai_app  # ← CHANGE: no renaming
     AI_SERVICE_AVAILABLE = True
     print("✅ AI Service loaded successfully")
 except ImportError as e:
     print(f"⚠️ AI Service not available: {e}")
     AI_SERVICE_AVAILABLE = False
     from fastapi import APIRouter
-    ai_router = APIRouter()
+    ai_app = APIRouter()  # ← CHANGE: fallback name
     
-    @ai_router.get("/ai/health")
+    @ai_app.get("/ai/health")
     async def ai_health_fallback():
         return {"status": "disabled", "message": "AI service not available"}
 
@@ -35,65 +35,9 @@ except ImportError as e:
 
 TOTAL_VIDEOS = 10000
 VIDEOS_PER_PAGE = 10
-
-# AI Service URL (for internal calls)
 AI_SERVICE_ENABLED = True
 
 logger = logging.getLogger(__name__)
-
-# ============================================================================
-# Pydantic Models
-# ============================================================================
-
-class Author(BaseModel):
-    id: str
-    name: str
-    avatar: str
-
-class Stats(BaseModel):
-    likes: int
-    comments: int
-    shares: int
-
-class Video(BaseModel):
-    id: str
-    author: Author
-    caption: str
-    hashtags: List[str]
-    video_url: str
-    thumbnail: str
-    stats: Stats
-    timestamp: int
-    is_following: bool = False
-    ai_score: Optional[float] = None
-
-class PaginatedResponse(BaseModel):
-    videos: List[Video]
-    next_cursor: Optional[str]
-    has_more: bool
-
-class CommentUser(BaseModel):
-    name: str
-    avatar: str
-
-class Comment(BaseModel):
-    id: str
-    user: CommentUser
-    text: str
-    likes: int
-    time: str
-
-class CommentCreate(BaseModel):
-    text: str = Field(..., min_length=1, max_length=500)
-
-class LikeAction(BaseModel):
-    action: str
-
-class SaveAction(BaseModel):
-    action: str
-
-class FollowAction(BaseModel):
-    action: str
 
 # ============================================================================
 # App Setup
@@ -110,14 +54,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount AI routes (ai_router is a FastAPI app, we need to mount it)
-# In FastAPI, to mount a sub-app, use app.mount() not include_router()
+# Mount AI app - THIS IS KEY
 if AI_SERVICE_AVAILABLE:
-    app.mount("/ai", ai_router)
+    app.mount("/ai", ai_app)  # ← CHANGE: use ai_app, not ai_router
     print("✅ AI routes mounted at /ai")
 else:
-    # If AI not available, still mount fallback routes
-    app.include_router(ai_router)
+    app.include_router(ai_app)  # fallback
+    print("⚠️ AI fallback routes mounted")
 
 # ============================================================================
 # Storage (In-memory)
