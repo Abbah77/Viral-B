@@ -238,21 +238,31 @@ async def fetch_ai_scores_async(user_id: str) -> Dict[str, float]:
     return {}
 
 def get_ai_scores_sync(user_id: str) -> Dict[str, float]:
-    """Synchronous wrapper for AI score fetching"""
-    if not AI_SERVICE_ENABLED or not AI_SERVICE_AVAILABLE:
+# REPLACE the async fetch_ai_scores_async and get_ai_scores_sync with this:
+
+def get_ai_scores_sync(user_id: str) -> Dict[str, float]:
+    """Synchronous AI score fetching - no event loop issues"""
+    if not AI_SERVICE_ENABLED:
         return {}
     
     try:
-        # Create new event loop for this operation
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(fetch_ai_scores_async(user_id))
-        loop.close()
-        return result
+        import requests
+        ai_url = os.environ.get('AI_SERVICE_URL', 'http://localhost:8000')
+        
+        # Use requests (synchronous) instead of aiohttp to avoid event loop issues
+        response = requests.get(f"{ai_url}/ai/feed/{user_id}?limit=100", timeout=2)
+        
+        if response.status_code == 200:
+            data = response.json()
+            scores = {}
+            for item in data.get('feed', []):
+                scores[item['video_id']] = item['score']
+            return scores
     except Exception as e:
-        logger.error(f"Error fetching AI scores: {e}")
-        return {}
-
+        logger.error(f"Failed to fetch AI scores: {e}")
+    
+    return {}
+    
 def get_videos(cursor_timestamp: Optional[int], limit: int, current_user_id: Optional[str] = None) -> List[dict]:
     """Get videos, optionally reordered by AI scores"""
     videos = []
