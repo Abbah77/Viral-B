@@ -34,7 +34,6 @@ ai_feed_service = None
 # ============================================================================
 
 class AISignal(BaseModel):
-    """Single user interaction signal"""
     video_id: str
     signal_type: str
     timestamp: int
@@ -44,17 +43,14 @@ class AISignal(BaseModel):
     session_id: Optional[str] = None
 
 class AIBatchRequest(BaseModel):
-    """Batch of signals from frontend"""
     signals: List[AISignal]
 
 class AIBatchResponse(BaseModel):
-    """Response for batch signal processing"""
     success: bool
     processed_count: int
     errors: List[str] = []
 
 class AIVideoScore(BaseModel):
-    """Scored video from AI"""
     video_id: str
     score: float
     engagement: Optional[float] = None
@@ -63,7 +59,6 @@ class AIVideoScore(BaseModel):
     trending: Optional[float] = None
 
 class AIPersonalizedFeedResponse(BaseModel):
-    """Personalized feed response"""
     feed: List[AIVideoScore]
     source: str
     latency_ms: float
@@ -71,7 +66,6 @@ class AIPersonalizedFeedResponse(BaseModel):
     candidates_generated: int
 
 class AIUserProfileResponse(BaseModel):
-    """User profile from AI"""
     user_id: str
     user_tier: str
     total_engagement: int
@@ -81,30 +75,25 @@ class AIUserProfileResponse(BaseModel):
     top_categories: List[Dict[str, float]]
 
 class AIHealthResponse(BaseModel):
-    """Health check response"""
     status: str
     redis_connected: bool
     service_initialized: bool
     timestamp: str
 
 # ============================================================================
-# Lifespan Manager (Initialize AI service on startup)
+# Lifespan Manager
 # ============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown events for AI service"""
     global ai_feed_service
     
-    # Startup
     logger.info("🚀 Initializing AI Service...")
     try:
         config = ProductionConfig()
-        
-        # Override Redis URL from environment
         redis_url = os.environ.get('REDIS_URL', config.redis_url)
         config.redis_url = redis_url
-        logger.info(f"Using Redis URL: {redis_url.replace('://', '://***@') if '@' in redis_url else redis_url[:20]}...")
+        logger.info(f"Using Redis URL: {redis_url[:20]}..." if redis_url else "No Redis URL")
         
         ai_feed_service = FeedService(config)
         await ai_feed_service.initialize()
@@ -115,24 +104,21 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Shutdown
     logger.info("🛑 Shutting down AI Service...")
     if ai_feed_service:
         await ai_feed_service.close()
     logger.info("✅ AI Service shutdown complete")
 
 # ============================================================================
-# FastAPI App
+# FastAPI App (NO /ai prefix in routes!)
 # ============================================================================
 
 ai_app = FastAPI(
     title="Viral AI Service",
     version="1.0.0",
-    description="AI-powered recommendation engine for Viral App",
     lifespan=lifespan
 )
 
-# CORS
 ai_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -146,13 +132,11 @@ ai_app.add_middleware(
 # ============================================================================
 
 def get_ai_service():
-    """Get AI service instance (raises if not initialized)"""
     if ai_feed_service is None:
         raise HTTPException(status_code=503, detail="AI Service not initialized")
     return ai_feed_service
 
 def signal_type_to_ai_format(signal: AISignal) -> Dict:
-    """Convert frontend signal format to AI engine format"""
     type_mapping = {
         'complete_watch': 'complete_watch',
         'rewatch': 'watch_75pct',
@@ -184,12 +168,11 @@ def signal_type_to_ai_format(signal: AISignal) -> Dict:
     }
 
 # ============================================================================
-# AI Endpoints
+# AI Endpoints - NO /ai prefix (mounting adds it)
 # ============================================================================
 
-@ai_app.get("/ai/health", response_model=AIHealthResponse)
+@ai_app.get("/health", response_model=AIHealthResponse)  # ← REMOVED /ai/
 async def ai_health():
-    """Check AI service health"""
     service = ai_feed_service
     
     redis_connected = False
@@ -207,12 +190,11 @@ async def ai_health():
         timestamp=datetime.now().isoformat()
     )
 
-@ai_app.post("/ai/batch", response_model=AIBatchResponse)
+@ai_app.post("/batch", response_model=AIBatchResponse)  # ← REMOVED /ai/
 async def process_batch_signals(
     request: AIBatchRequest,
     background_tasks: BackgroundTasks
 ):
-    """Process batch of user interaction signals for AI learning."""
     service = get_ai_service()
     errors = []
     processed = 0
@@ -255,13 +237,12 @@ async def process_batch_signals(
         errors=errors
     )
 
-@ai_app.get("/ai/feed/{user_id}", response_model=AIPersonalizedFeedResponse)
+@ai_app.get("/feed/{user_id}", response_model=AIPersonalizedFeedResponse)  # ← REMOVED /ai/
 async def get_personalized_feed(
     user_id: str,
     limit: int = Query(20, ge=1, le=100),
     include_scores: bool = Query(False)
 ):
-    """Get personalized video feed for a user."""
     service = get_ai_service()
     
     try:
@@ -295,9 +276,8 @@ async def get_personalized_feed(
         logger.error(f"Error generating feed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@ai_app.get("/ai/user/{user_id}/profile", response_model=AIUserProfileResponse)
+@ai_app.get("/user/{user_id}/profile", response_model=AIUserProfileResponse)  # ← REMOVED /ai/
 async def get_user_profile(user_id: str):
-    """Get AI user profile with interests and affinities"""
     service = get_ai_service()
     
     try:
@@ -332,7 +312,7 @@ async def get_user_profile(user_id: str):
         logger.error(f"Error getting profile: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@ai_app.post("/ai/video/{video_id}/interaction")
+@ai_app.post("/video/{video_id}/interaction")  # ← REMOVED /ai/
 async def record_single_interaction(
     video_id: str,
     user_id: str = Query(..., description="Current user ID"),
@@ -341,7 +321,6 @@ async def record_single_interaction(
     duration: float = Query(60, description="Video duration"),
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
-    """Record a single interaction (alternative to batch endpoint)"""
     service = get_ai_service()
     
     async def record():
@@ -357,11 +336,10 @@ async def record_single_interaction(
     
     return {"success": True, "message": "Interaction recorded"}
 
-@ai_app.get("/ai/trending")
+@ai_app.get("/trending")  # ← REMOVED /ai/
 async def get_trending_videos(
     limit: int = Query(50, ge=1, le=200)
 ):
-    """Get globally trending videos from AI"""
     service = get_ai_service()
     
     try:
@@ -379,7 +357,5 @@ async def get_trending_videos(
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================================
-# Router for mounting
+# End of file - ai_app is ready to be imported
 # ============================================================================
-
-ai_app = ai_app
