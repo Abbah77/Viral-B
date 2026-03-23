@@ -7,6 +7,7 @@ import random
 import asyncio
 import logging
 import os
+import requests
 from datetime import datetime
 from typing import Optional, List, Dict, Set
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
@@ -107,7 +108,7 @@ app.add_middleware(
 )
 
 # ============================================================================
-# AI Service Import and Mount (AFTER app is created)
+# AI Service Import and Mount
 # ============================================================================
 
 try:
@@ -204,11 +205,11 @@ def generate_video(index: int, current_user_id: Optional[str] = None, ai_score: 
     return video
 
 # ============================================================================
-# AI Score Fetching (Fixed Event Loop Issue)
+# AI Score Fetching (Synchronous - No Event Loop Issues)
 # ============================================================================
 
-async def fetch_ai_scores_async(user_id: str) -> Dict[str, float]:
-    """Async version of AI score fetching"""
+def get_ai_scores_sync(user_id: str) -> Dict[str, float]:
+    """Synchronous AI score fetching - no event loop issues"""
     if not AI_SERVICE_ENABLED or not AI_SERVICE_AVAILABLE:
         return {}
     
@@ -219,50 +220,28 @@ async def fetch_ai_scores_async(user_id: str) -> Dict[str, float]:
             return ai_score_cache.get(user_id, {})
     
     try:
-        import aiohttp
+        # Use requests (synchronous) to avoid event loop issues
         ai_url = os.environ.get('AI_SERVICE_URL', 'http://localhost:8000')
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{ai_url}/ai/feed/{user_id}?limit=100") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    scores = {}
-                    for item in data.get('feed', []):
-                        scores[item['video_id']] = item['score']
-                    
-                    ai_score_cache[user_id] = scores
-                    ai_score_cache_timestamp[user_id] = now
-                    return scores
-    except Exception as e:
-        logger.error(f"Failed to fetch AI scores: {e}")
-    
-    return {}
-
-def get_ai_scores_sync(user_id: str) -> Dict[str, float]:
-# REPLACE the async fetch_ai_scores_async and get_ai_scores_sync with this:
-
-def get_ai_scores_sync(user_id: str) -> Dict[str, float]:
-    """Synchronous AI score fetching - no event loop issues"""
-    if not AI_SERVICE_ENABLED:
-        return {}
-    
-    try:
-        import requests
-        ai_url = os.environ.get('AI_SERVICE_URL', 'http://localhost:8000')
-        
-        # Use requests (synchronous) instead of aiohttp to avoid event loop issues
-        response = requests.get(f"{ai_url}/ai/feed/{user_id}?limit=100", timeout=2)
+        response = requests.get(
+            f"{ai_url}/ai/feed/{user_id}?limit=100",
+            timeout=2
+        )
         
         if response.status_code == 200:
             data = response.json()
             scores = {}
             for item in data.get('feed', []):
                 scores[item['video_id']] = item['score']
+            
+            # Update cache
+            ai_score_cache[user_id] = scores
+            ai_score_cache_timestamp[user_id] = now
             return scores
     except Exception as e:
         logger.error(f"Failed to fetch AI scores: {e}")
     
     return {}
-    
+
 def get_videos(cursor_timestamp: Optional[int], limit: int, current_user_id: Optional[str] = None) -> List[dict]:
     """Get videos, optionally reordered by AI scores"""
     videos = []
