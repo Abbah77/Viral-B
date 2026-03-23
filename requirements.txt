@@ -25,3 +25,4 @@ python-dotenv
 click
 loguru
 aiofiles
+requests
