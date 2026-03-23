@@ -4,6 +4,7 @@ AI Service for Viral App - With Redis Connection
 
 import os
 import logging
+import asyncio
 from datetime import datetime
 from typing import Optional, List, Dict
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
@@ -17,9 +18,8 @@ try:
     print("✅ Redis package available")
 except ImportError:
     REDIS_AVAILABLE = False
-    print("⚠️ Redis package not installed - installing redis may fix this")
+    print("⚠️ Redis package not installed")
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ class AIHealthResponse(BaseModel):
     redis_error: Optional[str] = None
 
 # ============================================================================
-# Redis Connection Manager
+# Redis Connection Manager (Manual Initialization)
 # ============================================================================
 
 class RedisManager:
@@ -72,45 +72,51 @@ class RedisManager:
         self.client = None
         self.connected = False
         self.error = None
+        self._connect_sync()  # Connect immediately when created
     
-    async def connect(self):
-        """Connect to Redis"""
+    def _connect_sync(self):
+        """Synchronous connection attempt (runs at module load)"""
         redis_url = os.environ.get('REDIS_URL')
         
         if not redis_url:
-            self.error = "REDIS_URL environment variable not set"
+            self.error = "REDIS_URL not set"
             logger.warning(self.error)
-            return False
+            return
         
         if not REDIS_AVAILABLE:
-            self.error = "redis package not installed. Run: pip install redis"
+            self.error = "redis package not installed"
             logger.error(self.error)
-            return False
+            return
         
+        # Try to connect synchronously
         try:
-            logger.info(f"Attempting to connect to Redis: {redis_url[:30]}...")
-            self.client = await redis.from_url(
-                redis_url,
-                decode_responses=True,
-                socket_timeout=5,
-                socket_connect_timeout=5
-            )
-            await self.client.ping()
+            import redis as sync_redis
+            logger.info(f"Attempting Redis connection...")
+            r = sync_redis.from_url(redis_url, decode_responses=True, socket_timeout=5)
+            r.ping()
             self.connected = True
             logger.info("✅ Connected to Redis successfully!")
-            return True
+            
+            # Store the URL for async operations
+            self.redis_url = redis_url
         except Exception as e:
             self.error = str(e)
             logger.error(f"❌ Redis connection failed: {e}")
-            return False
     
-    async def close(self):
-        if self.client:
-            await self.client.close()
-            self.connected = False
-            logger.info("Redis connection closed")
+    async def get_client(self):
+        """Get async Redis client (lazy initialization)"""
+        if self.client is None and self.connected:
+            try:
+                self.client = await redis.from_url(
+                    self.redis_url,
+                    decode_responses=True,
+                    socket_timeout=5
+                )
+            except Exception as e:
+                logger.error(f"Async client creation failed: {e}")
+        return self.client
 
-# Global Redis manager
+# Global Redis manager (initializes immediately)
 redis_manager = RedisManager()
 
 # ============================================================================
@@ -138,20 +144,6 @@ ai_app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ============================================================================
-# Startup & Shutdown Events
-# ============================================================================
-
-@ai_app.on_event("startup")
-async def startup_event():
-    """Connect to Redis on startup"""
-    await redis_manager.connect()
-
-@ai_app.on_event("shutdown")
-async def shutdown_event():
-    """Close Redis connection on shutdown"""
-    await redis_manager.close()
 
 # ============================================================================
 # AI Endpoints
@@ -191,16 +183,14 @@ async def process_batch_signals(
                     video_signals[signal.video_id] = []
                 video_signals[signal.video_id].append(signal.dict())
                 
-                # Also store in Redis if connected
-                if redis_manager.connected and redis_manager.client:
+                # Store in Redis if connected
+                if redis_manager.connected:
                     try:
-                        key = f"user:{signal.user_id}:signals"
-                        await redis_manager.client.lpush(key, signal.json())
-                        await redis_manager.client.expire(key, 86400)  # 24 hours
-                        
-                        # Also store signal count
-                        count_key = f"user:{signal.user_id}:{signal.signal_type}:count"
-                        await redis_manager.client.incr(count_key)
+                        client = await redis_manager.get_client()
+                        if client:
+                            key = f"user:{signal.user_id}:signals"
+                            await client.lpush(key, signal.json())
+                            await client.expire(key, 86400)
                     except Exception as redis_error:
                         logger.error(f"Redis store error: {redis_error}")
                 
@@ -225,8 +215,6 @@ async def get_personalized_feed(
     include_scores: bool = Query(False)
 ):
     """Get personalized video feed"""
-    
-    # Simple feed generation
     feed_items = []
     for i in range(min(limit, 20)):
         feed_items.append(AIVideoScore(
@@ -257,11 +245,9 @@ async def get_user_profile(user_id: str):
         "user_tier": "engaged" if len(signals) > 50 else "casual" if len(signals) > 10 else "new",
         "total_engagement": len(signals),
         "trust_score": 0.5,
-        "top_interests": [],
-        "top_creators": [],
-        "top_categories": [],
         "signal_breakdown": signal_counts,
-        "redis_connected": redis_manager.connected
+        "redis_connected": redis_manager.connected,
+        "redis_error": redis_manager.error
     }
 
 @ai_app.get("/stats")
@@ -276,47 +262,20 @@ async def get_stats():
         "redis_error": redis_manager.error
     }
 
-@ai_app.post("/video/{video_id}/interaction")
-async def record_single_interaction(
-    video_id: str,
-    user_id: str,
-    interaction_type: str,
-    watch_time: float = 0,
-    duration: float = 60,
-    background_tasks: BackgroundTasks = BackgroundTasks()
-):
-    """Record a single interaction"""
-    
-    async def record():
-        if user_id not in user_signals:
-            user_signals[user_id] = []
-        user_signals[user_id].append({
-            "video_id": video_id,
-            "signal_type": interaction_type,
-            "timestamp": datetime.now().timestamp(),
-            "watch_time": watch_time,
-            "duration": duration
-        })
-    
-    background_tasks.add_task(record)
-    return {"success": True, "message": "Interaction recorded"}
-
-# ============================================================================
-# Debug endpoint
-# ============================================================================
-
 @ai_app.get("/debug/env")
 async def debug_env():
     """Debug endpoint to check environment"""
     return {
         "redis_url_set": bool(os.environ.get('REDIS_URL')),
-        "redis_url_preview": os.environ.get('REDIS_URL', 'NOT SET')[:40] + "..." if os.environ.get('REDIS_URL') else 'NOT SET',
-        "service_initialized": True,
-        "total_users": len(user_signals),
-        "total_signals": sum(len(s) for s in user_signals.values()),
+        "redis_url_preview": os.environ.get('REDIS_URL', 'NOT SET')[:50] + "..." if os.environ.get('REDIS_URL') else 'NOT SET',
         "redis_available": REDIS_AVAILABLE,
         "redis_connected": redis_manager.connected,
-        "redis_error": redis_manager.error
+        "redis_error": redis_manager.error,
+        "total_users": len(user_signals),
+        "total_signals": sum(len(s) for s in user_signals.values())
     }
 
 print("✅ AI Service loaded successfully!")
+print(f"   Redis connected: {redis_manager.connected}")
+if redis_manager.error:
+    print(f"   Redis error: {redis_manager.error}")
