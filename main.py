@@ -2,7 +2,6 @@ import asyncio
 import random
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from TikTokApi import TikTokApi
 import yt_dlp
 
 app = FastAPI()
@@ -14,74 +13,60 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- THE PROXY ENGINE ---
-# I've put a sample of your list here. You can add more from your list above.
-PROXY_POOL = [
-    "http://159.65.221.25:80", "http://4.195.16.140:80", "http://143.42.66.91:80",
-    "http://91.132.92.231:80", "http://69.70.244.34:80", "http://147.231.163.133:80",
-    "http://38.34.179.104:8447", "http://38.34.179.66:8444", "http://196.1.93.10:80"
-]
-
+# Store for our real TikTok data
 video_cache = []
 
-def get_stream_link(url):
-    """Extracts the playable link using a random proxy"""
-    proxy = random.choice(PROXY_POOL)
+def fetch_real_tiktok_trending():
+    """Uses yt-dlp to scrape the actual TikTok trending section"""
+    # Using 'titles' and 'urls' from the actual TikTok trending page
     ydl_opts = {
         'format': 'best',
         'quiet': True,
-        'proxy': proxy,
-        'socket_timeout': 10,
-        'nocheckcertificate': True
+        'no_warnings': True,
+        'extract_flat': 'in_playlist',
+        'playlist_items': '1-10',
     }
+    
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
-            info = ydl.extract_info(url, download=False)
-            return {
-                "id": info.get('id'),
-                "video_url": info.get('url'),
-                "thumbnail": info.get('thumbnail'),
-                "caption": info.get('title', 'Trending Content'),
-                "author": f"@{info.get('uploader', 'creator')}"
-            }
-        except:
-            return None
-
-async def discovery_worker():
-    """The Engine: Runs in the background so your app is always fast"""
-    while True:
-        try:
-            proxy = random.choice(PROXY_POOL)
-            async with TikTokApi(proxy=proxy) as api:
-                # This handles the 'msToken' and 'X-Bogus' automatically
-                await api.create_sessions(num_sessions=1, sleep=1)
-                
-                async for video in api.trending.videos(count=10):
-                    url = f"https://tiktok.com@{video.author.username}/video/{video.id}"
-                    data = get_stream_link(url)
-                    if data:
-                        video_cache.append(data)
-                        # Keep cache healthy (max 50 videos)
-                        if len(video_cache) > 50: video_cache.pop(0)
+            # This hits the actual trending playlist on TikTok
+            meta = ydl.extract_info("https://tiktok.com", download=False)
+            results = []
             
-            print(f"Engine Updated: {len(video_cache)} videos ready.")
-            await asyncio.sleep(300) # Re-scrape every 5 minutes
+            for entry in meta.get('entries', []):
+                # Now we get the direct playable CDN link for each
+                with yt_dlp.YoutubeDL({'format': 'best', 'quiet': True}) as ydl_inner:
+                    v_info = ydl_inner.extract_info(entry['url'], download=False)
+                    results.append({
+                        "id": v_info.get('id'),
+                        "video_url": v_info.get('url'), # REAL TIKTOK CDN LINK
+                        "thumbnail": v_info.get('thumbnail'),
+                        "caption": v_info.get('title'),
+                        "author_name": f"@{v_info.get('uploader')}"
+                    })
+            return results
         except Exception as e:
-            print(f"Worker Error (Retrying): {e}")
-            await asyncio.sleep(30)
+            print(f"Scrape Error: {e}")
+            return []
+
+async def worker():
+    """Background task to keep the feed fresh"""
+    global video_cache
+    while True:
+        real_vids = fetch_real_tiktok_trending()
+        if real_vids:
+            video_cache = real_vids
+            print(f"✅ Success: {len(video_cache)} Real TikToks Cached")
+        await asyncio.sleep(600) # Refresh every 10 mins
 
 @app.on_event("startup")
-async def startup_event():
-    # Start the engine the moment the server turns on
-    asyncio.create_task(discovery_worker())
+async def startup():
+    asyncio.create_task(worker())
 
 @app.get("/feed/live")
 async def get_feed():
-    if not video_cache:
-        return {"status": "loading", "videos": []}
-    # Return 5 random videos from our fresh cache
-    return {"videos": random.sample(video_cache, min(len(video_cache), 5))}
+    return {"videos": video_cache}
 
 @app.get("/")
 def health():
-    return {"status": "online"}
+    return {"status": "running"}
