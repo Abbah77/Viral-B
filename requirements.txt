@@ -4,4 +4,3 @@ yt-dlp
 playwright
 playwright-stealth
 TikTokApi
-aiohttp
