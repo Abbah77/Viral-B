@@ -1,27 +1,29 @@
-# Core
-fastapi
-uvicorn[standard]
-python-multipart
+# Core Web Framework
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
 
-# HTTP
-aiohttp
-httpx
+# HTTP Client
+aiohttp==3.9.0
+httpx==0.25.0
 
-# Database & Cache
-redis
-async-timeout
-
-# AI/ML
-torch
-numpy
-scikit-learn
+# Database (Supabase)
+supabase==2.0.0
 
 # Data Validation
-pydantic
-pydantic-settings
+pydantic==2.5.0
+pydantic-settings==2.1.0
 
-# Utils
-python-dotenv
-click
-loguru
-aiofiles
+# Utilities
+python-dotenv==1.0.0
+click==8.1.7
+loguru==0.7.2
+aiofiles==23.2.1
+
+# Optional: Only if you need async timeout
+async-timeout==4.0.3
+
+# Optional: Only if you're actually using ML/AI
+# numpy==1.24.3
+# scikit-learn==1.3.2
+# torch -- skip unless absolutely needed (very large)
